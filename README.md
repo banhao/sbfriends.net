@@ -1,5 +1,5 @@
-# **Use "QuesTrade" as SEC data source.**
-# **"financialdatasets.ai" terminated the CRYPTO PRICE API, Not recommended to use their data services.**
+# **SEC data is from "QuesTrade"**
+# **CRYPTO data is from "Binance Public Market"**
 
 If you want to use the other source data, you need change the code and the API KEY.
 
