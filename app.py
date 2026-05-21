@@ -3,11 +3,12 @@
 
 # Author: banhao@gmail.com
 # Version: 3.0 
-# Issue Date: March 15, 2026
-# Release Note: "QUESTRADE" supply the SEC data
+# Issue Date: May 20, 2026
+# Release Note: SEC data is from "QUESTRADE". Crypto data is from "Binance Public Market".
 
 from waitress import serve
 from flask import Flask, request, jsonify, render_template
+from werkzeug.middleware.proxy_fix import ProxyFix
 import ta as ta_lib
 import os
 import json
@@ -17,7 +18,7 @@ import pandas_ta as ta
 import numpy as np
 import re
 from dotenv import load_dotenv
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import time
 from threading import Lock
@@ -102,10 +103,8 @@ def refresh_questrade_token(force=False):
 #new_content = re.sub(r'^(QUESTRADE_TOKEN=).*$',rf'\1{REFRESH_TOKEN}',content,flags=re.MULTILINE)
 #env_path.write_text(new_content, encoding="utf-8")
 
-# conf.get_default().region = "us"
-
 # Function to fetch tickers from API
-def fetch_tickers(url):
+def fetch_SEC_tickers(url):
     try:
         response = requests.get(url)
         response.raise_for_status()
@@ -115,9 +114,62 @@ def fetch_tickers(url):
         print(f"Error fetching tickers from {url}: {e}")
         return []
 
+def fetch_Crypto_tickers(url):
+    try:
+        params = {"permissions": "SPOT"}
+        response = requests.get(url, params=params)
+        if response.status_code == 200:
+            data = response.json()
+            symbols = data.get("symbols", [])
+            filtered_symbols = [
+                s for s in symbols 
+                if s['status'] == 'TRADING' 
+                and s['quoteAsset'] in ['USDT', 'BTC']
+            ]
+            sorted_symbols = sorted(filtered_symbols, key=lambda x: x['symbol'])
+            symbol_list = [s['symbol'] for s in sorted_symbols]
+            return symbol_list
+    except requests.exceptions.RequestException as e:
+        print(f"Error fetching tickers from {url}: {e}")
+        return []
+
+def download_klines_full(symbol, interval, start_date, end_date, limit=1000):
+    """
+    Download full historical klines even if longer than 1000 candles
+    """
+    url = "https://data-api.binance.vision/api/v3/klines"
+    # Convert dates to milliseconds
+    start_ts = int(pd.to_datetime(start_date).timestamp() * 1000)
+    end_ts   = int(pd.to_datetime(end_date).timestamp() * 1000)
+    all_data = []
+    current_start = start_ts
+    print(f"Downloading {symbol} {interval} from {start_date} to {end_date}...")
+    while current_start < end_ts:
+        params = {
+            "symbol": symbol,
+            "interval": interval,
+            "limit": limit,
+            "startTime": current_start,
+            "endTime": end_ts
+        }
+        response = requests.get(url, params=params)
+        if response.status_code != 200:
+            print("Error:", response.status_code, response.text)
+            break
+        data = response.json()
+        if not data:
+            break
+        all_data.extend(data)
+        # Update start time for next request (use the last candle's close time)
+        last_candle_time = data[-1][0]          # close time of last candle
+        current_start = last_candle_time + 1    # +1ms to avoid overlap
+        print(f"✅ Downloaded {len(data)} candles | Total: {len(all_data)} | Last time: {pd.to_datetime(last_candle_time, unit='ms')}")
+        time.sleep(0.4)   # Be gentle with the API (avoid rate limit)
+    return all_data
+
 # Fetch tickers
-SEC_tickers = fetch_tickers(SEC_URL)
-CRYPTO_tickers = fetch_tickers(CRYPTO_URL)
+SEC_tickers = fetch_SEC_tickers(SEC_URL)
+CRYPTO_tickers = fetch_Crypto_tickers(CRYPTO_URL)
 
 # HTML Template with Indicators Dropdown
 index_html_template = """
@@ -622,39 +674,14 @@ index_html_template = """
         
             if (selectedCategory === "CRYPTO") {{
                 // Extract number and unit
-                var match = intervalRaw.match(/^(\\d+)([mhDWY])$/i);
-                if (!match) {{
-                    alert("Invalid interval format.");
-                    return;
-                }}
-        
-                var num = parseInt(match[1], 10);
-                var unit = match[2].toUpperCase();
-        
-                if (unit === 'H') {{
-                    interval = "minute";
-                    intervalMultiplier = num * 60;
-                }}else if (unit === 'D') {{
-                    interval = "day";
-                    intervalMultiplier = num;
-                }} else if (unit === 'W') {{
-                    interval = "week";
-                    intervalMultiplier = num;
-                }} else if (unit === 'M') {{
-                    interval = "month";
-                    intervalMultiplier = num;
-                }} else {{
-                    alert("Unsupported interval unit.");
-                    return;
-                }}
+                var interval = intervalRaw;
             }} else {{
                 var unitMap = {{
                     '1h':  'OneHour',
                     '4h':  'FourHours',
-                    '1D':  'OneDay',
-                    '1W':  'OneWeek',
-                    '1M':  'OneMonth',
-                    '1Y':  'OneYear'
+                    '1d':  'OneDay',
+                    '1w':  'OneWeek',
+                    '1M':  'OneMonth'
                 }};
 
                 interval = unitMap[intervalRaw] || intervalRaw;  // fallback to raw if no mapping
@@ -672,7 +699,7 @@ index_html_template = """
             const endpoint = selectedCategory === "CRYPTO" ? "/crypto/prices" : "/prices";
             resultArea.innerHTML = "Loading...";
             document.getElementById('chart').innerHTML = ""; // Clear the chart while loading
-            fetch(`${{endpoint}}?ticker=${{selectedTicker}}&category=${{selectedCategory}}&interval=${{interval}}&interval_multiplier=${{intervalMultiplier}}&start_date=${{startDate}}&end_date=${{endDate}}&bollinger_delta_window=${{bollingerDeltaWindow}}&indicators=${{selectedIndicators.join(',')}}`)
+            fetch(`${{endpoint}}?ticker=${{selectedTicker}}&category=${{selectedCategory}}&interval=${{interval}}&start_date=${{startDate}}&end_date=${{endDate}}&bollinger_delta_window=${{bollingerDeltaWindow}}&indicators=${{selectedIndicators.join(',')}}`)
                 .then(response => {{
                     if (!response.ok) {{
                         return response.json().then(err => {{ throw new Error(err.error || `HTTP error! status: ${{response.status}}`); }});
@@ -974,8 +1001,8 @@ index_html_template = """
     <select id="interval">
         <option value="1h" selected>1 Hour</option>
         <option value="4h" selected>4 Hours</option>
-        <option value="1D" selected>1 Day</option>
-        <option value="1W">1 Week</option>
+        <option value="1d" selected>1 Day</option>
+        <option value="1w">1 Week</option>
         <option value="1M">1 Month</option>
     </select>
     <label for="start_date">Start Date:</label>
@@ -1043,7 +1070,7 @@ index_html_template = """
         <label style="font-size: 9px; font-family: Arial, sans-serif;">SEC data is from "QuesTrade"</label>
     </div>
     <div>
-        <label style="font-size: 9px; font-family: Arial, sans-serif;">CRYPTO data is from "financialdatasets.ai"</label>
+        <label style="font-size: 9px; font-family: Arial, sans-serif;">CRYPTO data is from "Binance Public Market"</label>
     </div>
 </div>
 <div class="content">
@@ -1084,10 +1111,11 @@ with open("./templates/index.html", "w", encoding="utf-8") as file:
 print("index.html file has been created successfully.")
 
 app = Flask(__name__)
+app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_prefix=1)
 app.secret_key = os.urandom(24)  # For session security
 
 # Helper function to fetch OHLC prices
-def OHLC_PRICES(category, ticker, interval, interval_multiplier, start_date, end_date):
+def OHLC_PRICES(category, ticker, interval, start_date, end_date):
     if category == "SEC":
         access_token, api_server = refresh_questrade_token()
         api_server = api_server.rstrip('/')
@@ -1126,33 +1154,15 @@ def OHLC_PRICES(category, ticker, interval, interval_multiplier, start_date, end
                 return {"error": f"Ticker {ticker if category == 'SEC' else ticker} data does not exist"}
             return {"error": str(e)}    
     elif category == "CRYPTO":
-        url = "https://api.financialdatasets.ai/crypto/prices"
-        headers = {"X-API-KEY": FINANCIAL_API_KEY}
-        querystring = {
-            "limit": "5000",
-            "ticker": ticker,
-            "interval": interval,
-            "interval_multiplier": interval_multiplier,
-            "start_date": start_date,
-            "end_date": end_date
-        }
-        print(f"Calling API: {url} with params: {querystring}")
-        try:
-            response = requests.get(url, headers=headers, params=querystring)
-            response.raise_for_status()
-            print(f"API response status: {response.status_code}")
-            data = response.json()
-            # print(f"API response: {data}")
-            # Check if the API response indicates the ticker is invalid
-            if "error" in data and "not found" in data["error"].lower():
-                return {"error": f"Ticker {ticker if category == 'CRYPTO' else ticker} data does not exist"}
-            return data
-        except requests.exceptions.RequestException as e:
-            print(f"API request failed: {str(e)}")
-            # Check if the error indicates the ticker is invalid (e.g., 404 Not Found)
-            if "404" in str(e) or "not found" in str(e).lower():
-                return {"error": f"Ticker {ticker if category == 'CRYPTO' else ticker} data does not exist"}
-            return {"error": str(e)}
+        data = download_klines_full(
+            symbol = ticker,
+            interval = interval,
+            start_date = start_date,
+            end_date = end_date
+        )
+        if "error" in data and "not found" in data["error"].lower():
+            return {"error": f"Ticker {ticker if category == 'CRYPTO' else ticker} data does not exist"}
+        return data
     else:
         return {"error": "Invalid category"}
 
@@ -1230,22 +1240,25 @@ def Signal_Buy_Sell(serial_data):
 # Helper function to process OHLC data
 def process_ohlc_data(data, category, ticker, indicators, bollinger_delta_window):
     if category == "CRYPTO":
-#        df = data.get("prices", {}).get("prices", [])
-        df = data.get("prices", [])
+        if not data:
+            return None, {"error": f"Ticker {ticker} data does not exist"}
+        if len(data) < 10:
+            return None, {"error": f"Not enough data points for indicators (got {len(df)}, need at least 10)"}
+        df = pd.DataFrame(data, columns=['unixtime', 'open', 'high', 'low', 'close', 'volume','CloseTime', 'QuoteVolume', 'Trades', 'TakerBuyBase','TakerBuyQuote', 'Ignore'])
+        df['datetime_utc'] = pd.to_datetime(df['unixtime'], unit='ms', utc=True)
+        df['time'] = df['datetime_utc'].dt.strftime('%Y-%m-%d %H:%M:%S')
+        df = df[['time', 'open', 'high', 'low', 'close', 'volume']]
     else:  # SEC
         df = data.get("prices", [])
-    print(f"Extracted prices: {df[:2]}")
-    print(f"Number of price rows: {len(df)}")
-    if not df:
-        return None, {"error": f"Ticker {ticker} data does not exist"}
-    if len(df) < 10:
-        return None, {"error": f"Not enough data points for indicators (got {len(df)}, need at least 10)"}
-    # Convert to DataFrame
-    df = pd.DataFrame(df)
+        if not df:
+            return None, {"error": f"Ticker {ticker} data does not exist"}
+        if len(df) < 10:
+            return None, {"error": f"Not enough data points for indicators (got {len(df)}, need at least 10)"}
+        df = pd.DataFrame(df)
     print(f"DataFrame columns: {df.columns.tolist()}")
     print(f"Sample data (first 2 rows):\n{df.head(2)}")
     # Handle different column names for closing price
-    possible_close_columns = ['close', 'price', 'last_price', 'close_price', 'value']
+    possible_close_columns = ['close', 'price', 'last_price', 'close_price', 'value', 'open', 'high', 'low', 'volume']
     close_column = None
     for col in possible_close_columns:
         if col in df.columns:
@@ -1257,10 +1270,12 @@ def process_ohlc_data(data, category, ticker, indicators, bollinger_delta_window
             print(f"Renamed '{close_column}' column to 'close'")
     else:
         return None, {"error": f"Missing closing price column. Expected one of {possible_close_columns}"}
-    # Ensure 'close' column is numeric
-    df['close'] = pd.to_numeric(df['close'], errors='coerce')
-    if df['close'].isna().all():
-        return None, {"error": "All 'close' values are invalid or missing"}
+    # Ensure 'open, high, low, close' columns are numeric
+    cols_to_numeric = ['open', 'high', 'low', 'close', 'volume']
+    for col in cols_to_numeric:
+        df[col] = pd.to_numeric(df[col], errors='coerce')
+        if df['close'].isna().all():
+            return None, {"error": "All 'close' values are invalid or missing"}
     # Check for sufficient non-NaN values
     if df['close'].dropna().count() < 10:
         return None, {"error": f"Not enough valid 'close' values for indicators (got {df['close'].dropna().count()}, need at least 10)"}
@@ -1286,6 +1301,7 @@ def process_ohlc_data(data, category, ticker, indicators, bollinger_delta_window
     # Keep only rows with valid data
     # df = df.dropna(subset=['BBU_10_2.0', 'BBL_10_2.0'])
     print(f"Rows after dropna: {len(df)}")
+    print(f"Sample data (first 2 rows):\n{df.head(2)}")
     if len(df) == 0:
         return None, {"error": "No valid data after indicator calculations"}
     # Convert to JSON-serializable format
@@ -1387,34 +1403,19 @@ def get_ohlc_prices():
     ticker = request.args.get("ticker")
     category = request.args.get("category")
     interval = request.args.get("interval")
-    interval_multiplier = request.args.get("interval_multiplier")
     start_date = request.args.get("start_date")
     end_date = request.args.get("end_date")
     bollinger_delta_window = int(request.args.get("bollinger_delta_window"))
     indicators = request.args.get("indicators", "").split(",") if request.args.get("indicators") else []
 
     # Validate query parameters
-    if not all([ticker, category, interval, interval_multiplier, start_date, end_date]):
+    if not all([ticker, category, interval, start_date, end_date]):
         return jsonify({"error": "All fields are required"}), 400
 
     # Validate category
     if category not in ["SEC", "CRYPTO"]:
         return jsonify({"error": "Invalid category. Must be 'SEC' or 'CRYPTO'"}), 400
-
-    # Validate interval
-    if category == "CRYPTO":
-        valid_intervals = ["second", "minute", "day", "week", "month", "year"]
-        if interval not in valid_intervals:
-            return jsonify({"error": f"Invalid interval. Must be one of {valid_intervals}"}), 400
-
-    # Validate interval multiplier
-    try:
-        interval_multiplier = int(interval_multiplier)
-        if interval_multiplier < 1:
-            raise ValueError
-    except ValueError:
-        return jsonify({"error": "Interval multiplier must be a positive integer"}), 400
-
+    
     # Validate and adjust dates
     try:
         start_dt = datetime.strptime(start_date, "%Y-%m-%d")
@@ -1439,7 +1440,7 @@ def get_ohlc_prices():
         print(f"Adjusted start_date to ensure enough data: {start_date}")
 
     # Fetch data from API
-    data = OHLC_PRICES(category, ticker, interval, interval_multiplier, start_date, end_date)
+    data = OHLC_PRICES(category, ticker, interval, start_date, end_date)
     if "error" in data:
         return jsonify({"error": data["error"]}), 400 if "data does not exist" in data["error"] else 500
 
@@ -1466,8 +1467,8 @@ def get_ohlc_prices():
 #        return None
 
 if __name__ == "__main__":
-    #serve(app, host="127.0.0.1", port=5000)                   # DEV mode
-    app.run(host="0.0.0.0", port=5000, debug=True)           # PROD mode
+    #serve(app, host="127.0.0.1", port=5000, debug=True)      # DEV mode
+    app.run(host="0.0.0.0", port=5000, debug=False)           # PROD mode
     # webhook_url = start_ngrok()
     # if webhook_url:
     #     from waitress import serve
